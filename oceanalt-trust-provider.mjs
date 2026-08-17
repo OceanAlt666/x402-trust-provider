@@ -37,7 +37,28 @@ const DEFAULT_BASE = "https://oceanalt.com";
  * @property {Object} [subject]                           // 被评估对象(此处=被筛查地址)
  */
 
-const SCHEMA = "x402-trust-provider/0.1";
+const SCHEMA = "x402-trust-provider/0.2"; // 对齐 #2299 讨论区共同语言:score 可空+null_reason、direction、basis[]、issued_at/expires_at
+const VERSION = "0.2.0";
+
+// 把 OceanAlt evidence[] 映射成结构化 basis[](class/kind/source/ref/url/observed_at)——
+// 替代单一 evidence_uri 作主证据容器(evidence_uri 降为辅助)。每条可寻址、可核验、带观测时间。
+function toBasis(r, observed_at) {
+  const ev = Array.isArray(r?.evidence) ? r.evidence : [];
+  return ev.map((e) => ({
+    class: "regulatory",
+    kind: /冻结|frozen|blacklist/i.test(e.label || "") ? "issuer-freeze"
+      : /制裁|sanction|OFAC/i.test(e.label || "") ? "sanctions-list"
+      : /混币|mixer/i.test(e.label || "") ? "mixer-list"
+      : /沾染|taint/i.test(e.label || "") ? "onchain-taint"
+      : /情报/i.test(e.label || "") ? "intel-db"
+      : "onchain-heuristic",
+    source: e.source || "OceanAlt",
+    ref: e.url || "",   // 内容/浏览器可寻址引用
+    url: e.url || "",
+    detail: String(e.detail || e.label || "").slice(0, 300),
+    observed_at,
+  }));
+}
 
 // 默认地址提取:从 TrustQuery 里找出「要做合规筛查的地址」。
 // 合规筛查看的是【资金对手方/来源地址】(收到/付出的是不是黑钱),不是 agent 的行为——
@@ -81,36 +102,45 @@ export async function evaluateAddress(address, opts = {}) {
   const baseUrl = (opts.baseUrl || DEFAULT_BASE).replace(/\/$/, "");
   const network = opts.network || "";
   const ttl = opts.ttlSeconds ?? 3600; // 保守 1h(制裁名单可能更新);比 12h 缓存更短
-  const now = new Date().toISOString();
+  const issued_at = new Date().toISOString();
+  const expires_at = new Date(Date.now() + ttl * 1000).toISOString();
+  const direction = opts.direction || "payee"; // 我们筛查【资金对手方/收款方】,非 payer 行为
   const q = new URLSearchParams({ addr: String(address || "") });
   if (network) q.set("network", network);
   const evidence_uri = `${baseUrl}/api/risk?${q.toString()}`;
 
   const base = {
-    schema: SCHEMA, provider: "OceanAlt", provider_url: baseUrl,
-    evidenceType: /** @type {EvidenceType} */ ("regulatory"),
-    evidence_uri, ttl_seconds: ttl, evaluated_at: now,
+    schema: SCHEMA, version: VERSION, provider: "OceanAlt", provider_url: baseUrl,
+    category: "compliance", evidenceType: /** @type {EvidenceType} */ ("regulatory"), direction,
+    evidence_uri, ttl_seconds: ttl, issued_at, expires_at, evaluated_at: issued_at,
     subject: { address, network: network || "auto" },
   };
-  if (!address) return { ...base, decision: "UNCERTAIN", score: 0, reason_code: "NO_ADDRESS" };
+  // 未知/无法评估 → decision=UNCERTAIN,【score=null + null_reason】,绝不编造分数(不许伪造)。
+  const uncertain = (null_reason, reason_code = "SCREENING_UNAVAILABLE") =>
+    ({ ...base, decision: "UNCERTAIN", score: null, null_reason, reason_code, basis: [] });
+  if (!address) return uncertain("no address provided", "NO_ADDRESS");
 
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 12000);
     const res = await fetch(evidence_uri, { signal: ctrl.signal, headers: { accept: "application/json" } }).finally(() => clearTimeout(t));
-    if (!res.ok) return { ...base, decision: "UNCERTAIN", score: 0, reason_code: "SCREENING_UNAVAILABLE" };
+    if (!res.ok) return uncertain(`upstream screening unavailable (HTTP ${res.status})`);
     const r = await res.json();
-    const risk = Number.isFinite(r.risk) ? r.risk : 50;
+    // 有明确判决(clear/caution/risky)才给数值 score;拿不到 risk = 未知 → null + null_reason。
+    const hasRisk = Number.isFinite(r.risk);
+    const score = hasRisk ? +(1 - Math.min(100, Math.max(0, r.risk)) / 100).toFixed(2) : null;
     return {
       ...base,
-      decision: mapDecision(r.verdict),
-      score: +(1 - Math.min(100, Math.max(0, risk)) / 100).toFixed(2),
+      decision: mapDecision(r.verdict), // FAIL 仅来自 risky(命中制裁/混币/冻结/沾染=足够强证据)
+      score,
+      ...(score === null ? { null_reason: "upstream returned no risk value" } : {}),
       reason_code: reasonCode(r),
-      subject: { address, network: network || "auto", verdict: r.verdict, risk: r.risk, evidence: r.evidence },
+      basis: toBasis(r, issued_at), // 结构化可核验证据(替代单一 evidence_uri)
+      subject: { address, network: network || "auto", verdict: r.verdict, risk: r.risk ?? null },
     };
   } catch {
-    // fail-closed:抓取失败 → UNCERTAIN,绝不当作 PASS 放行
-    return { ...base, decision: "UNCERTAIN", score: 0, reason_code: "SCREENING_UNAVAILABLE" };
+    // fail-closed:抓取失败 → UNCERTAIN(score=null),绝不当作 PASS 放行
+    return uncertain("screening request failed (network/timeout)");
   }
 }
 
