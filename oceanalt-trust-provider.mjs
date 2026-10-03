@@ -1,182 +1,129 @@
-// OceanAlt × x402 Trust-Provider — 参考适配器 (Draft v0.1)
-// 把 OceanAlt 的合规风险筛查(/api/risk)接进 x402 的 trust-provider 扩展
-// (issue #2299 / PR #2300 的 onBeforeSettle 钩子)。定位:regulatory(监管/合规)类信任提供方,
-// 与 behavioral(行为)类互补——一笔支付可能行为过关但合规不过关,反之亦然。
+// OceanAlt x402 trust-provider adapter v0.3 (experimental)
+// Targets the draft TrustProviderConfig / TrustEvaluation types proposed in x402 PR #2300 (head 9e38112).
+// The extension is not merged; field names may change. See README.md.
 //
-// 诚实边界(不过度承诺):这是「compliance risk screening(合规风险筛查)」信号——
-// 命中制裁/混币器/诈骗名单、发行方(USDT/USDC)冻结、链上启发式风险,并给可核验证据。
-// 它不是「完整 AML 合规认证」;PASS 表示"本提供方未发现拦截理由",不等于"绝对安全"。
+// PASS means no reason to block was found, not that the wallet is safe.
+// Anything unreadable becomes UNCERTAIN, never PASS.
 //
-// 跑法(实打 oceanalt.com 生产接口,非 PPT):node oceanalt-trust-provider.mjs
-// 接法:const provider = oceanAltTrustProvider(); registerTrustProvider(provider) …(见 README)
+// Run: node oceanalt-trust-provider.mjs
 
 const DEFAULT_BASE = "https://oceanalt.com";
+const SCHEMA = "x402-trust-evaluation-v0.1";
+export const VERSION = "0.3.0";
 
-/**
- * @typedef {"PASS"|"FAIL"|"UNCERTAIN"} TrustDecision  // #2300:fail-closed
- * @typedef {"behavioral"|"regulatory"|"self-attested"|"third-party"|"cryptographic"|"observational"|"delivery"} EvidenceType
- *
- * @typedef {Object} TrustQuery                          // #2300 输入(节选)
- * @property {string} [schema]
- * @property {{ agent_id?: string, address?: string }} [payer]   // agent_id 为 DID;address=付款来源地址(若可得)
- * @property {{ url?: string, method?: string, amount?: string|number, payTo?: string, network?: string }} [resource]
- * @property {{ category?: string, risk_band?: string }} [context]
- * @property {string} [requested_at]
- *
- * @typedef {Object} TrustEvaluation                     // #2300 输出
- * @property {string} schema
- * @property {string} provider
- * @property {string} provider_url
- * @property {TrustDecision} decision
- * @property {number} score                               // 0..1,1=最可信(= 1 - risk/100)
- * @property {EvidenceType} evidenceType
- * @property {string} reason_code
- * @property {string} evidence_uri                        // 可点开自核的证据 URL(/api/risk 原始返回)
- * @property {number} ttl_seconds
- * @property {string} evaluated_at
- * @property {Object} [subject]                           // 被评估对象(此处=被筛查地址)
- */
+/** @typedef {"PASS"|"FAIL"|"UNCERTAIN"} TrustDecision */
 
-const SCHEMA = "x402-trust-provider/0.2"; // 对齐 #2299 讨论区共同语言:score 可空+null_reason、direction、basis[]、issued_at/expires_at
-const VERSION = "0.2.0";
+// evidence_as_of keys from /api/decide -> evidence source. The "ofac" key covers every government
+// sanctions or seizure list the API checks, not only OFAC SDN, so it maps to a generic source.
+const SOURCE_OF = {
+  ofac: "government-sanctions-lists",
+  mixer: "oceanalt-risk-list:mixer",
+  phish: "oceanalt-risk-list:phishing",
+  "phish-domain": "oceanalt-risk-list:phishing-domain",
+  ransomware: "oceanalt-risk-list:ransomware",
+  hack: "oceanalt-risk-list:exploit",
+  scam: "oceanalt-risk-list:scam",
+};
 
-// 把 OceanAlt evidence[] 映射成结构化 basis[](class/kind/source/ref/url/observed_at)——
-// 替代单一 evidence_uri 作主证据容器(evidence_uri 降为辅助)。每条可寻址、可核验、带观测时间。
-function toBasis(r, observed_at) {
-  const ev = Array.isArray(r?.evidence) ? r.evidence : [];
-  return ev.map((e) => ({
-    class: "regulatory",
-    kind: /冻结|frozen|blacklist/i.test(e.label || "") ? "issuer-freeze"
-      : /制裁|sanction|OFAC/i.test(e.label || "") ? "sanctions-list"
-      : /混币|mixer/i.test(e.label || "") ? "mixer-list"
-      : /沾染|taint/i.test(e.label || "") ? "onchain-taint"
-      : /情报/i.test(e.label || "") ? "intel-db"
-      : "onchain-heuristic",
-    source: e.source || "OceanAlt",
-    ref: e.url || "",   // 内容/浏览器可寻址引用
-    url: e.url || "",
-    detail: String(e.detail || e.label || "").slice(0, 300),
-    observed_at,
+// OceanAlt decision -> draft TrustDecision (fail-closed)
+const DECISION = { decline: "FAIL", review: "UNCERTAIN", allow: "PASS" };
+
+/** One evidence item per list; the anchor is the date that list was read (as_of), plus a publisher digest when available. */
+function toEvidence(r) {
+  const asOf = r?.evidence_as_of && typeof r.evidence_as_of === "object" ? r.evidence_as_of : {};
+  const hitKinds = new Set((r?.signal_keys || []).filter((k) => k.startsWith("list.")).map((k) => k.slice(5)));
+  const lists = Object.entries(asOf).map(([kind, date]) => ({
+    evidenceType: "list_membership",
+    source: SOURCE_OF[kind] || `oceanalt-risk-list:${kind}`,
+    anchor: { as_of: date, ...(r?.list_digests?.[kind] ? { digest: r.list_digests[kind] } : {}) },
+    status: hitKinds.has(kind) ? "listed" : "not_listed",
   }));
+  return lists;
 }
 
-// 默认地址提取:从 TrustQuery 里找出「要做合规筛查的地址」。
-// 合规筛查看的是【资金对手方/来源地址】(收到/付出的是不是黑钱),不是 agent 的行为——
-// 与 behavioral 提供方看 payer.agent_id 的行为分不同。实际字段以最终 wire type 为准,这里可配置覆盖。
-function defaultExtractAddress(query) {
-  return (
-    query?.payer?.address ||
-    query?.subject?.address ||
-    query?.resource?.payTo ||
-    query?.resource?.address ||
-    null
-  );
-}
-
-// verdict → TrustDecision(fail-closed:拿不到结论一律 UNCERTAIN,绝不静默 PASS)
-function mapDecision(verdict) {
-  if (verdict === "risky") return "FAIL";
-  if (verdict === "clear") return "PASS";
-  return "UNCERTAIN"; // caution / 未知 / 错误
-}
-
-function reasonCode(r) {
-  const s = (r?.signals || []).join(" ");
-  if (/制裁|sanction|OFAC/i.test(s)) return "SANCTIONS_MATCH";
-  if (/混币|mixer|Tornado/i.test(s)) return "MIXER_TAINT";
-  if (/冻结|frozen|blacklist/i.test(s)) return "ISSUER_FROZEN";
-  if (/沾染|taint/i.test(s)) return "ONCHAIN_TAINT";
-  if (r?.verdict === "risky") return "ONCHAIN_HIGH_RISK";
-  if (r?.verdict === "caution") return "RISK_SIGNALS_PRESENT";
-  if (r?.verdict === "clear") return "NO_RISK_SIGNAL"; // 注意:未见信号 ≠ 绝对安全
-  return "SCREENING_UNAVAILABLE";
+function uncertain(base, reason_code) {
+  return { ...base, decision: "UNCERTAIN", reason_code, evidence: [] };
 }
 
 /**
- * 直接对一个地址做评估并返回符合 #2300 的 TrustEvaluation。fail-closed。
- * @param {string} address
+ * Screen one wallet and return a draft TrustEvaluation plus evidence[]. Fail-closed.
+ * @param {string|null|undefined} address
  * @param {{ baseUrl?: string, network?: string, ttlSeconds?: number, timeoutMs?: number }} [opts]
- * @returns {Promise<TrustEvaluation>}
  */
-export async function evaluateAddress(address, opts = {}) {
+export async function evaluateWallet(address, opts = {}) {
   const baseUrl = (opts.baseUrl || DEFAULT_BASE).replace(/\/$/, "");
-  const network = opts.network || "";
-  const ttl = opts.ttlSeconds ?? 3600; // 保守 1h(制裁名单可能更新);比 12h 缓存更短
-  const issued_at = new Date().toISOString();
-  const expires_at = new Date(Date.now() + ttl * 1000).toISOString();
-  const direction = opts.direction || "payee"; // 我们筛查【资金对手方/收款方】,非 payer 行为
-  const q = new URLSearchParams({ addr: String(address || "") });
-  if (network) q.set("network", network);
-  const evidence_uri = `${baseUrl}/api/risk?${q.toString()}`;
-
+  const evaluated_at = new Date().toISOString();
   const base = {
-    schema: SCHEMA, version: VERSION, provider: "OceanAlt", provider_url: baseUrl,
-    category: "compliance", evidenceType: /** @type {EvidenceType} */ ("regulatory"), direction,
-    evidence_uri, ttl_seconds: ttl, issued_at, expires_at, evaluated_at: issued_at,
-    subject: { address, network: network || "auto" },
+    schema: SCHEMA,
+    provider: "oceanalt",
+    provider_url: baseUrl,
+    ttl_seconds: opts.ttlSeconds ?? 3600,
+    evaluated_at,
   };
-  // 未知/无法评估 → decision=UNCERTAIN,【score=null + null_reason】,绝不编造分数(不许伪造)。
-  const uncertain = (null_reason, reason_code = "SCREENING_UNAVAILABLE") =>
-    ({ ...base, decision: "UNCERTAIN", score: null, null_reason, reason_code, basis: [] });
-  if (!address) return uncertain("no address provided", "NO_ADDRESS");
+  if (!address) return uncertain(base, "no_wallet_in_query");
 
+  const q = new URLSearchParams({ to: String(address) });
+  if (opts.network) q.set("network", opts.network);
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 12000);
-    const res = await fetch(evidence_uri, { signal: ctrl.signal, headers: { accept: "application/json" } }).finally(() => clearTimeout(t));
-    if (!res.ok) return uncertain(`upstream screening unavailable (HTTP ${res.status})`);
+    const res = await fetch(`${baseUrl}/api/decide?${q}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 12000),
+    });
+    if (!res.ok) return uncertain(base, `screening_unavailable_http_${res.status}`);
     const r = await res.json();
-    // 有明确判决(clear/caution/risky)才给数值 score;拿不到 risk = 未知 → null + null_reason。
-    const hasRisk = Number.isFinite(r.risk);
-    const score = hasRisk ? +(1 - Math.min(100, Math.max(0, r.risk)) / 100).toFixed(2) : null;
+    const decision = DECISION[r?.decision];
+    if (!decision) return uncertain(base, "screening_unreadable");
     return {
       ...base,
-      decision: mapDecision(r.verdict), // FAIL 仅来自 risky(命中制裁/混币/冻结/沾染=足够强证据)
-      score,
-      ...(score === null ? { null_reason: "upstream returned no risk value" } : {}),
-      reason_code: reasonCode(r),
-      basis: toBasis(r, issued_at), // 结构化可核验证据(替代单一 evidence_uri)
-      subject: { address, network: network || "auto", verdict: r.verdict, risk: r.risk ?? null },
+      decision,
+      ...(Number.isFinite(r.risk) ? { score: +(1 - Math.min(100, Math.max(0, r.risk)) / 100).toFixed(2) } : {}),
+      reason_code: r.reason_code || "unspecified",
+      // Ed25519-signed evidence bundle for this address, verifiable offline
+      evidence_uri: `${baseUrl}/api/evidence/bundle?address=${encodeURIComponent(address)}`,
+      evidence: toEvidence(r),
+      screened_network: r.screened_network || opts.network || null,
     };
   } catch {
-    // fail-closed:抓取失败 → UNCERTAIN(score=null),绝不当作 PASS 放行
-    return uncertain("screening request failed (network/timeout)");
+    return uncertain(base, "screening_request_failed");
   }
 }
 
 /**
- * 构造一个符合 #2300 TrustProviderConfig 的合规信任提供方:{ name, evaluate(query) }。
- * @param {{ baseUrl?: string, network?: string, extractAddress?: (q: TrustQuery)=>(string|null) }} [opts]
+ * Draft TrustProviderConfig. Screens query.payer.wallet by default.
+ * @param {{ baseUrl?: string, network?: string, pickWallet?: (q:any)=>string|null }} [opts]
  */
-export function oceanAltTrustProvider(opts = {}) {
-  const extract = opts.extractAddress || defaultExtractAddress;
+export function oceanaltTrustProvider(opts = {}) {
+  const pick = opts.pickWallet || ((q) => q?.payer?.wallet || null);
   return {
-    name: "oceanalt-compliance",
-    /** @param {TrustQuery} query @returns {Promise<TrustEvaluation>} */
-    evaluate: (query) => evaluateAddress(extract(query), { baseUrl: opts.baseUrl, network: opts.network || query?.resource?.network }),
+    name: "oceanalt",
+    evaluate: (query) => evaluateWallet(pick(query), {
+      baseUrl: opts.baseUrl,
+      // the API infers the chain from the address format unless a network is given
+      network: opts.network,
+    }),
   };
 }
 
-export default oceanAltTrustProvider;
+export default oceanaltTrustProvider;
 
-// ── 可跑 demo(实打 oceanalt.com /api/risk)────────────────────────────────
-// node oceanalt-trust-provider.mjs  → 打印三个真实用例的 TrustEvaluation。
-const isMain = (() => { try { return import.meta.url === `file://${process.argv[1]}` || import.meta.url.endsWith(process.argv[1]?.replace(/\\/g, "/")); } catch { return false; } })();
+// demo: node oceanalt-trust-provider.mjs
+const isMain = (() => { try { return import.meta.url.endsWith(process.argv[1]?.replace(/\\/g, "/")); } catch { return false; } })();
 if (isMain) {
-  const CASES = [
-    { label: "PASS · 干净活跃地址", addr: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", network: "ethereum" },
-    { label: "FAIL · 制裁/混币器(Tornado Cash)", addr: "0x8589427373d6d84e98730d7795d8f6f8731fda16", network: "ethereum" },
-    { label: "UNCERTAIN · 筛查不可用(fail-closed 演示,故意打不通的 base)", addr: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", network: "ethereum", baseUrl: "https://oceanalt.invalid" },
+  const provider = oceanaltTrustProvider({ network: "ethereum" });
+  const query = (wallet) => ({
+    schema: "x402-trust-query-v0.1",
+    payer: { wallet },
+    resource: { url: "https://example.com/paid", amount: { value: "0.85", currency: "USDC", chain: "eip155:1" } },
+    requested_at: new Date().toISOString(),
+  });
+  const cases = [
+    ["clean active wallet", provider, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"],
+    ["mixer contract", provider, "0x8589427373d6d84e98730d7795d8f6f8731fda16"],
+    ["upstream unreachable (fail-closed)", oceanaltTrustProvider({ baseUrl: "https://oceanalt.invalid" }), "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"],
+    ["no wallet in query", provider, null],
   ];
-  console.log("OceanAlt × x402 Trust-Provider 参考适配器 — 实打生产接口 demo\n");
-  for (const c of CASES) {
-    const ev = await evaluateAddress(c.addr, { network: c.network, baseUrl: c.baseUrl });
-    console.log(`【${c.label}】`);
-    console.log(`  decision=${ev.decision}  score=${ev.score}  evidenceType=${ev.evidenceType}  reason=${ev.reason_code}`);
-    console.log(`  evidence_uri=${ev.evidence_uri}`);
-    if (ev.subject?.verdict) console.log(`  (OceanAlt verdict=${ev.subject.verdict} risk=${ev.subject.risk})`);
-    console.log("");
+  for (const [label, p, w] of cases) {
+    const ev = await p.evaluate(query(w));
+    console.log(`\n# ${label}\n` + JSON.stringify(ev, null, 2));
   }
-  console.log("要点:regulatory 类 FAIL 在 aggregateByEvidenceType 下应【中止结算】;筛查不可用→UNCERTAIN(绝不静默 PASS)。");
-  console.log("这不是 PPT,是能跑的代码——每个 decision 都可用 evidence_uri 点开自核。");
 }
