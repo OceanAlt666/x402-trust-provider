@@ -59,6 +59,7 @@ No API key is needed. Anonymous calls are rate limited and metered; see https://
 ## Versions
 
 - `v0.3` (2026-10-02): aligned to the PR's current types (`payer.wallet`, `x402-trust-evaluation-v0.1`), decision API instead of raw screening, per-list `evidence[]`.
+- `v0.2` (2026-09): aligned with the #2299 discussion at the time, kept at tag `v0.2`.
 - `v0.1` (2026-08-17): first draft, kept at tag `v0.1`.
 
 MIT © OceanAlt
